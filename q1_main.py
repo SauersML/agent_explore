@@ -769,10 +769,16 @@ def build_agents(final_state: SimulationState) -> list[Agent]:
 
 def to_jax_arrays(state: SimulationState) -> dict[str, jnp.ndarray]:
     """Return the four spec-required environment tensors as a labelled dict."""
+    completed_tournaments = int(state.tournament_index)
+    if completed_tournaments > 0:
+        battle_outcome = state.battle_history[:, :, :, completed_tournaments - 1]
+    else:
+        battle_outcome = state.tournament_outcomes
+
     return {
         "zone_array": state.zone_array,
         "action_array": state.action_array,
-        "battle_outcome": state.tournament_outcomes,
+        "battle_outcome": battle_outcome,
         "battle_history": state.battle_history,
     }
 
