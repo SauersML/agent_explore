@@ -1,6 +1,6 @@
 import time
 from dataclasses import dataclass
-from typing import NamedTuple, Optional, Tuple, cast
+from typing import Mapping, NamedTuple, Optional, Sequence, Tuple, cast
 
 import jax
 import jax.lax as lax
@@ -9,7 +9,6 @@ import jax.numpy as jnp
 import jax.random
 import numpy as np
 import numpy.typing as npt
-import pandas as pd
 
 
 NUM_AGENTS = 64
@@ -28,28 +27,58 @@ ACTION_NO_OP = 0
 ACTION_WATCH_BASE = 1
 ACTION_MOVE_BASE = ACTION_WATCH_BASE + NUM_COOPS
 
-LOG_PROBABILITY_FLOOR = -30.0
-PROBABILITY_EPSILON = 1e-7
 ABILITY_SCORE_POLICY_WEIGHT = 0.65
 KING_BELIEF_POLICY_WEIGHT = 0.35
 PAIR_SENTINEL = NUM_AGENTS
+FLOAT32_OPEN_PROBABILITY_MIN = float(np.finfo(np.float32).tiny)
+FLOAT32_OPEN_PROBABILITY_MAX = 1.0 - float(np.finfo(np.float32).eps)
 
 
-def clip_probability(probability_tensor: jnp.ndarray) -> jnp.ndarray:
-    """Project numerically noisy probabilities back into the unit interval."""
-    return jnp.clip(probability_tensor, 0.0, 1.0)
+def clip_open_probability(probability_tensor: jnp.ndarray) -> jnp.ndarray:
+    """Clamp probabilities into the open unit interval for stable log-likelihood math."""
+    return jnp.clip(
+        probability_tensor, FLOAT32_OPEN_PROBABILITY_MIN, FLOAT32_OPEN_PROBABILITY_MAX
+    )
 
 
-def stable_log_probability(probability_tensor: jnp.ndarray) -> jnp.ndarray:
-    """Numerically stable log for probabilities represented in float32."""
-    clipped_probability = jnp.clip(probability_tensor, PROBABILITY_EPSILON, 1.0)
-    return jnp.maximum(jnp.log(clipped_probability), LOG_PROBABILITY_FLOOR)
+def compute_empirical_crown_frequency(
+    crown_history: jnp.ndarray, completed_tournaments: jnp.ndarray
+) -> jnp.ndarray:
+    """
+    Posterior predictive crown probability from public tournament-close crown history.
+
+    Each `(agent, coop)` crown assignment is treated as a Bernoulli event with a
+    Beta(1, 1) prior, so the posterior predictive probability is the empirical
+    crown frequency with Laplace smoothing.
+    """
+    crown_counts = crown_history.astype(jnp.float32).sum(axis=-1)
+    return (crown_counts + 1.0) / (completed_tournaments.astype(jnp.float32) + 2.0)
 
 
-def stable_log_complement(probability_tensor: jnp.ndarray) -> jnp.ndarray:
-    """Numerically stable log(1 - p) for probabilities represented in float32."""
-    clipped_probability = jnp.clip(probability_tensor, 0.0, 1.0 - PROBABILITY_EPSILON)
-    return jnp.maximum(jnp.log1p(-clipped_probability), LOG_PROBABILITY_FLOOR)
+def format_table(
+    rows: Sequence[Mapping[str, object]],
+    column_order: Optional[Sequence[str]] = None,
+) -> str:
+    """Render a simple left-aligned plain-text table."""
+    if not rows:
+        return ""
+
+    ordered_columns = list(column_order or rows[0].keys())
+    rendered_rows = [
+        {column: str(row[column]) for column in ordered_columns}
+        for row in rows
+    ]
+    column_widths = {
+        column: max(len(column), *(len(row[column]) for row in rendered_rows))
+        for column in ordered_columns
+    }
+
+    header = " ".join(column.rjust(column_widths[column]) for column in ordered_columns)
+    body = [
+        " ".join(row[column].rjust(column_widths[column]) for column in ordered_columns)
+        for row in rendered_rows
+    ]
+    return "\n".join([header, *body])
 
 
 def compute_ability_prior_log_probs() -> jnp.ndarray:
@@ -77,27 +106,13 @@ class Location:
 
 
 @dataclass
-class Cage:
-    """Fixed 1-vs-1 battle arena in a coop's BattleZone."""
-
-    cage_id: int
-    home_coop_index: int
-    current_occupant_indices: Optional[Tuple[int, int]] = None
-
-
-@dataclass
-class Monitor:
-    """Fixed observation point in a coop's SpectatorZone."""
-
-    monitor_id: int
-    installed_in_coop_index: int
-    viewing_coop_index: int
-
-
-@dataclass
 class Agent:
     """
-    Python-side view of one chicken reconstructed after the simulation.
+    Python-side post-simulation view of one chicken.
+
+    This is a reporting object reconstructed from the final tensor state. The
+    live simulation policy runs in JAX on `SimulationState`, not through
+    per-agent Python objects.
     """
 
     agent_index: int
@@ -108,23 +123,6 @@ class Agent:
     last_observation: np.ndarray
     king_belief: np.ndarray
 
-    def action_policy(self) -> Tuple[str, int]:
-        """Choose watch or move when the agent is in a spectator zone."""
-        if self.my_location.zone_index != ZONE_SPECTATOR:
-            return ("no_op", -1)
-
-        self_king_probability_per_coop = self.king_belief[self.agent_index, :, 1]
-        normalized_ability_per_coop = self.my_ability / NUM_ABILITY_LEVELS
-        coop_combined_score = (
-            ABILITY_SCORE_POLICY_WEIGHT * normalized_ability_per_coop
-            + KING_BELIEF_POLICY_WEIGHT * self_king_probability_per_coop
-        )
-        best_coop_index = int(np.argmax(coop_combined_score))
-
-        if best_coop_index != self.my_location.coop_index:
-            return ("move", best_coop_index)
-        return ("watch", self.my_location.coop_index)
-
 
 class SimulationState(NamedTuple):
     zone_array: jnp.ndarray
@@ -134,13 +132,18 @@ class SimulationState(NamedTuple):
     tournament_losses_per_coop: jnp.ndarray
     tournament_fought_matrix: jnp.ndarray
     tournament_outcomes: jnp.ndarray
-    tournament_obs_coverage: jnp.ndarray
+    tournament_step_obs_coverage: jnp.ndarray
+    tournament_step_outcomes: jnp.ndarray
+    battle_outcome: jnp.ndarray
     battle_history: jnp.ndarray
     obs_mask: jnp.ndarray
+    observation_history: jnp.ndarray
+    last_tournament_observed_outcomes: jnp.ndarray
     ability_beliefs: jnp.ndarray
     king_beliefs: jnp.ndarray
-    crown_counts: jnp.ndarray
+    crown_history: jnp.ndarray
     tournament_index: jnp.ndarray
+    tournament_step_index: jnp.ndarray
     step_done_flag: jnp.ndarray
     rng_key: jnp.ndarray
 
@@ -258,11 +261,12 @@ def dominance_battle(
     all_coop_pairs: jnp.ndarray,
     all_pair_counts: jnp.ndarray,
     battle_rng_subkeys: jnp.ndarray,
-) -> SimulationState:
+) -> Tuple[SimulationState, jnp.ndarray]:
     """Resolve all dominance battles across all coops."""
     tournament_outcomes = state.tournament_outcomes
     tournament_losses_per_coop = state.tournament_losses_per_coop
     tournament_fought_matrix = state.tournament_fought_matrix
+    step_outcomes = jnp.zeros((NUM_AGENTS, NUM_AGENTS, NUM_COOPS), dtype=jnp.int8)
 
     for coop_index in range(NUM_COOPS):
         pairs_this_coop = all_coop_pairs[coop_index]
@@ -293,6 +297,11 @@ def dominance_battle(
                 signed_left_perspective
             ).at[safe_right_agents, safe_left_agents, coop_index].add(-signed_left_perspective)
         )
+        step_outcomes = (
+            step_outcomes.at[safe_left_agents, safe_right_agents, coop_index].add(
+                signed_left_perspective
+            ).at[safe_right_agents, safe_left_agents, coop_index].add(-signed_left_perspective)
+        )
 
         left_agent_lost = (~left_agent_wins) & valid_pair_mask_bool
         right_agent_lost = left_agent_wins & valid_pair_mask_bool
@@ -309,18 +318,24 @@ def dominance_battle(
             ).at[safe_right_agents, safe_left_agents, coop_index].add(valid_pair_mask_int8)
         )
 
-    return state._replace(
-        tournament_outcomes=tournament_outcomes,
-        tournament_losses_per_coop=tournament_losses_per_coop,
-        tournament_fought_matrix=tournament_fought_matrix,
+    return (
+        state._replace(
+            tournament_outcomes=tournament_outcomes,
+            tournament_losses_per_coop=tournament_losses_per_coop,
+            tournament_fought_matrix=tournament_fought_matrix,
+        ),
+        step_outcomes,
     )
 
 
-def region_view(zone_array: jnp.ndarray, action_array: jnp.ndarray) -> jnp.ndarray:
+def compute_observation_coverage(
+    zone_array: jnp.ndarray, action_array: jnp.ndarray
+) -> jnp.ndarray:
     """Return observation coverage for the current step."""
+    action_codes = action_array[:, 0]
     battle_zone_coverage = zone_array[:, :, ZONE_BATTLE].astype(jnp.int8)
-    is_watching_action = (action_array >= ACTION_WATCH_BASE) & (action_array < ACTION_MOVE_BASE)
-    watched_coop_index = jnp.clip(action_array - ACTION_WATCH_BASE, 0, NUM_COOPS - 1)
+    is_watching_action = (action_codes >= ACTION_WATCH_BASE) & (action_codes < ACTION_MOVE_BASE)
+    watched_coop_index = jnp.clip(action_codes - ACTION_WATCH_BASE, 0, NUM_COOPS - 1)
     watched_coop_onehot = jax.nn.one_hot(watched_coop_index, NUM_COOPS, dtype=jnp.int8)
     is_in_spectator_zone = (zone_array[:, :, ZONE_SPECTATOR].sum(axis=1) > 0)[:, None]
     spectator_coverage = watched_coop_onehot * (
@@ -329,14 +344,15 @@ def region_view(zone_array: jnp.ndarray, action_array: jnp.ndarray) -> jnp.ndarr
     return jnp.clip(battle_zone_coverage + spectator_coverage, 0, 1).astype(jnp.int8)
 
 
-def relocate_region(
+def initiate_transit(
     zone_array: jnp.ndarray,
     action_array: jnp.ndarray,
     transit_destination_coop: jnp.ndarray,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """Move selected spectators into transit toward their destination coop."""
-    is_move_action = action_array >= ACTION_MOVE_BASE
-    destination_coop_indices = jnp.clip(action_array - ACTION_MOVE_BASE, 0, NUM_COOPS - 1)
+    action_codes = action_array[:, 0]
+    is_move_action = action_codes >= ACTION_MOVE_BASE
+    destination_coop_indices = jnp.clip(action_codes - ACTION_MOVE_BASE, 0, NUM_COOPS - 1)
     is_in_spectator_zone = zone_array[:, :, ZONE_SPECTATOR].sum(axis=1) > 0
     should_enter_transit = is_in_spectator_zone & is_move_action
 
@@ -355,20 +371,29 @@ def relocate_region(
     return updated_zone_array, updated_transit_destination
 
 
+def compute_policy_scores(
+    agent_abilities: jnp.ndarray,
+    king_beliefs: jnp.ndarray,
+) -> jnp.ndarray:
+    """Compute the live coop-selection score used by the JAX simulation policy."""
+    agent_index_range = jnp.arange(agent_abilities.shape[0])
+    self_king_probability_per_coop = king_beliefs[agent_index_range, agent_index_range, :, 1]
+    normalized_ability_per_coop = agent_abilities.astype(jnp.float32) / NUM_ABILITY_LEVELS
+    return (
+        ABILITY_SCORE_POLICY_WEIGHT * normalized_ability_per_coop
+        + KING_BELIEF_POLICY_WEIGHT * self_king_probability_per_coop
+    )
+
+
 def compute_all_agent_actions(
     zone_array: jnp.ndarray,
     agent_abilities: jnp.ndarray,
     king_beliefs: jnp.ndarray,
 ) -> jnp.ndarray:
     """Compute the watch/move action for every agent."""
-    agent_index_range = jnp.arange(NUM_AGENTS)
-    self_king_probability_per_coop = king_beliefs[agent_index_range, agent_index_range, :, 1]
-    coop_combined_score = (
-        ABILITY_SCORE_POLICY_WEIGHT * agent_abilities.astype(jnp.float32) / NUM_ABILITY_LEVELS
-        + KING_BELIEF_POLICY_WEIGHT * self_king_probability_per_coop
+    best_coop_per_agent = jnp.argmax(
+        compute_policy_scores(agent_abilities, king_beliefs), axis=1
     )
-
-    best_coop_per_agent = jnp.argmax(coop_combined_score, axis=1)
     current_coop_per_agent = jnp.argmax(zone_array.sum(axis=2), axis=1)
     already_in_best_coop = best_coop_per_agent == current_coop_per_agent
 
@@ -379,10 +404,8 @@ def compute_all_agent_actions(
     )
 
     is_in_spectator_zone = zone_array[:, :, ZONE_SPECTATOR].sum(axis=1) > 0
-    return cast(
-        jnp.ndarray,
-        jnp.where(is_in_spectator_zone, spectator_action, jnp.int32(ACTION_NO_OP)),
-    )
+    action_codes = jnp.where(is_in_spectator_zone, spectator_action, jnp.int32(ACTION_NO_OP))
+    return cast(jnp.ndarray, action_codes[:, None])
 
 
 def env_step(state: SimulationState) -> SimulationState:
@@ -424,18 +447,25 @@ def env_step(state: SimulationState) -> SimulationState:
         state_after_assignment.king_beliefs,
     )
     state_after_actions = state_after_assignment._replace(action_array=new_action_array)
-    state_after_battles = dominance_battle(
+    state_after_battles, step_outcomes = dominance_battle(
         state_after_actions, all_coop_pairs, all_pair_counts, battle_rng_subkeys
     )
 
-    new_step_obs_coverage = region_view(
+    new_step_obs_coverage = compute_observation_coverage(
         state_after_battles.zone_array, state_after_battles.action_array
     )
-    accumulated_obs_coverage = jnp.clip(
-        state_after_battles.tournament_obs_coverage + new_step_obs_coverage, 0, 1
-    ).astype(jnp.int8)
+    safe_step_index = jnp.minimum(
+        state_after_battles.tournament_step_index,
+        jnp.int32(MAX_STEPS_PER_TOURNAMENT - 1),
+    )
+    updated_step_obs_coverage = state_after_battles.tournament_step_obs_coverage.at[
+        safe_step_index
+    ].set(new_step_obs_coverage)
+    updated_step_outcomes = state_after_battles.tournament_step_outcomes.at[
+        safe_step_index
+    ].set(step_outcomes)
 
-    zone_after_movement, updated_transit_destination = relocate_region(
+    zone_after_movement, updated_transit_destination = initiate_transit(
         state_after_battles.zone_array,
         state_after_battles.action_array,
         state_after_battles.transit_destination_coop,
@@ -443,7 +473,10 @@ def env_step(state: SimulationState) -> SimulationState:
     return state_after_battles._replace(
         zone_array=zone_after_movement,
         transit_destination_coop=updated_transit_destination,
-        tournament_obs_coverage=accumulated_obs_coverage,
+        tournament_step_obs_coverage=updated_step_obs_coverage,
+        tournament_step_outcomes=updated_step_outcomes,
+        battle_outcome=step_outcomes,
+        tournament_step_index=state_after_battles.tournament_step_index + 1,
     )
 
 
@@ -462,29 +495,48 @@ def can_any_coop_pair(state: SimulationState) -> jnp.ndarray:
     return valid_pairing_exists
 
 
+def summarize_tournament_observations(
+    state: SimulationState,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Collapse per-step observation tensors into tournament-level coverage and outcomes."""
+    tournament_obs_coverage = jnp.clip(
+        state.tournament_step_obs_coverage.sum(axis=0), 0, 1
+    ).astype(jnp.int8)
+    tournament_observed_outcomes = (
+        state.tournament_step_obs_coverage[:, :, None, None, :].astype(jnp.int16)
+        * state.tournament_step_outcomes[:, None, :, :, :].astype(jnp.int16)
+    ).sum(axis=0).astype(jnp.int8)
+    return tournament_obs_coverage, tournament_observed_outcomes
+
+
 def update_ability_beliefs(state: SimulationState) -> SimulationState:
     """Update every observer's posterior over every agent's ability."""
     ability_beliefs = state.ability_beliefs
     is_self_pair = jnp.eye(NUM_AGENTS, dtype=jnp.bool_)
+    _, tournament_observed_outcomes = summarize_tournament_observations(state)
 
     for coop_index in range(NUM_COOPS):
-        outcomes_this_coop = state.tournament_outcomes[:, :, coop_index].astype(jnp.float32)
-        wins_this_coop = jnp.maximum(outcomes_this_coop, 0.0)
-        losses_this_coop = jnp.maximum(-outcomes_this_coop, 0.0)
+        observed_outcomes_this_coop = tournament_observed_outcomes[:, :, :, coop_index].astype(
+            jnp.float32
+        )
+        wins_this_coop = jnp.maximum(observed_outcomes_this_coop, 0.0)
+        losses_this_coop = jnp.maximum(-observed_outcomes_this_coop, 0.0)
         current_beliefs_this_coop = ability_beliefs[:, :, coop_index, :]
 
-        cumulative_belief = clip_probability(jnp.cumsum(current_beliefs_this_coop, axis=-1))
+        cumulative_belief = jnp.clip(jnp.cumsum(current_beliefs_this_coop, axis=-1), 0.0, 1.0)
         cdf_strictly_less = jnp.concatenate(
             [jnp.zeros_like(cumulative_belief[:, :, :1]), cumulative_belief[:, :, :-1]],
             axis=-1,
         )
 
-        win_probability = clip_probability(cdf_strictly_less + 0.5 * current_beliefs_this_coop)
-        log_win_probability = stable_log_probability(win_probability)
-        log_loss_probability = stable_log_complement(win_probability)
+        win_probability = clip_open_probability(
+            jnp.clip(cdf_strictly_less + 0.5 * current_beliefs_this_coop, 0.0, 1.0)
+        )
+        log_win_probability = jnp.log(win_probability)
+        log_loss_probability = jnp.log1p(-win_probability)
 
-        win_event_mask = wins_this_coop[None, :, :, None].astype(jnp.bool_)
-        loss_event_mask = losses_this_coop[None, :, :, None].astype(jnp.bool_)
+        win_event_mask = wins_this_coop[:, :, :, None].astype(jnp.bool_)
+        loss_event_mask = losses_this_coop[:, :, :, None].astype(jnp.bool_)
 
         log_likelihood_from_wins = jnp.where(
             win_event_mask, log_win_probability[:, None, :, :], 0.0
@@ -494,14 +546,16 @@ def update_ability_beliefs(state: SimulationState) -> SimulationState:
         ).sum(axis=2)
         total_log_likelihood = log_likelihood_from_wins + log_likelihood_from_losses
 
-        log_prior_this_coop = stable_log_probability(current_beliefs_this_coop)
+        log_prior_this_coop = jnp.log(clip_open_probability(current_beliefs_this_coop))
         log_unnormalized_posterior = log_prior_this_coop + total_log_likelihood
         log_partition = jax.nn.logsumexp(
             log_unnormalized_posterior, axis=-1, keepdims=True
         )
         normalized_posterior = jnp.exp(log_unnormalized_posterior - log_partition)
 
-        observed_this_coop = state.tournament_obs_coverage[:, coop_index].astype(jnp.bool_)
+        observed_this_coop = (jnp.abs(observed_outcomes_this_coop).sum(axis=(1, 2)) > 0).astype(
+            jnp.bool_
+        )
         updated_beliefs = jnp.where(
             observed_this_coop[:, None, None],
             normalized_posterior,
@@ -523,39 +577,49 @@ def update_ability_beliefs(state: SimulationState) -> SimulationState:
 
 
 def update_king_beliefs(state: SimulationState) -> SimulationState:
-    """Derive king-belief posteriors from current ability beliefs and zone assignments."""
-    king_beliefs = state.king_beliefs
+    """
+    Predict crown events from directly observed crown outcomes.
 
-    for coop_index in range(NUM_COOPS):
-        in_coop_indicator = state.zone_array[:, coop_index, ZONE_BATTLE].astype(jnp.float32)
-        beliefs_this_coop = state.ability_beliefs[:, :, coop_index, :]
-        cumulative_distribution = clip_probability(jnp.cumsum(beliefs_this_coop, axis=-1))
-        log_cdf = stable_log_probability(cumulative_distribution)
+    The king event is the crown assignment produced by the actual tournament
+    mechanics, not simply "highest ability in the coop". We therefore model
+    crown outcomes directly from tournament-close observations.
 
-        log_total_cdf_sum = jnp.einsum("j,ajv->av", in_coop_indicator, log_cdf)
-        log_product_of_other_cdfs = (
-            log_total_cdf_sum[:, None, :] - in_coop_indicator[None, :, None] * log_cdf
-        )
+    For each agent and coop, we keep a Beta-Bernoulli posterior predictive
+    crown probability derived from empirical crown frequencies:
 
-        king_probability = jnp.sum(
-            beliefs_this_coop * jnp.exp(log_product_of_other_cdfs), axis=-1
-        )
-        king_probability = jnp.clip(king_probability, 0.0, 1.0)
+        P(crown_in_k | observed crown history)
 
-        king_beliefs = king_beliefs.at[:, :, coop_index, :].set(
-            jnp.stack([1.0 - king_probability, king_probability], axis=-1)
-        )
-
+    Crown assignments are treated as public tournament-close observations, so
+    all observers share the same king-belief tensor.
+    """
+    posterior_predictive_king_probability = compute_empirical_crown_frequency(
+        state.crown_history, state.tournament_index
+    )
+    shared_king_probability = jnp.broadcast_to(
+        posterior_predictive_king_probability[None, :, :],
+        (NUM_AGENTS, NUM_AGENTS, NUM_COOPS),
+    )
+    king_beliefs = jnp.stack(
+        [1.0 - shared_king_probability, shared_king_probability],
+        axis=-1,
+    )
     return state._replace(king_beliefs=king_beliefs)
 
 
 def close_tournament(state: SimulationState, rng_subkey: jnp.ndarray) -> SimulationState:
     """Write history, assign crowns, reshuffle agents, and reset tournament state."""
     tournament_idx = state.tournament_index
+    tournament_obs_coverage, tournament_observed_outcomes = summarize_tournament_observations(
+        state
+    )
     battle_history = state.battle_history.at[:, :, :, tournament_idx].set(
         state.tournament_outcomes
     )
-    obs_mask = state.obs_mask.at[:, :, tournament_idx].set(state.tournament_obs_coverage)
+    obs_mask = state.obs_mask.at[:, :, tournament_idx].set(tournament_obs_coverage)
+    observation_history = state.observation_history.at[:, :, :, tournament_idx].set(
+        tournament_observed_outcomes.sum(axis=-1).astype(jnp.int8)
+    )
+    last_tournament_observed_outcomes = tournament_observed_outcomes
 
     wins_per_agent_per_coop = jnp.maximum(state.tournament_outcomes, 0).sum(axis=1)
     losses_per_agent_per_coop = jnp.maximum(-state.tournament_outcomes, 0).sum(axis=1)
@@ -569,7 +633,9 @@ def close_tournament(state: SimulationState, rng_subkey: jnp.ndarray) -> Simulat
     crown_this_tournament = jnp.where(
         any_undefeated_in_coop[None, :], undefeated_in_coop, most_wins_in_coop
     )
-    new_crown_counts = state.crown_counts + crown_this_tournament.astype(jnp.int32)
+    crown_history = state.crown_history.at[:, :, tournament_idx].set(
+        crown_this_tournament.astype(jnp.int8)
+    )
 
     noise_rng, random_assignment_rng = jax.random.split(rng_subkey)
     tie_breaking_noise = jax.random.uniform(noise_rng, (NUM_AGENTS, NUM_COOPS)) * 0.1
@@ -591,20 +657,29 @@ def close_tournament(state: SimulationState, rng_subkey: jnp.ndarray) -> Simulat
     return state._replace(
         zone_array=new_zone_array,
         transit_destination_coop=jnp.full((NUM_AGENTS,), -1, jnp.int32),
-        action_array=jnp.zeros((NUM_AGENTS,), jnp.int32),
+        action_array=jnp.zeros((NUM_AGENTS, 1), jnp.int32),
         tournament_losses_per_coop=jnp.zeros((NUM_AGENTS, NUM_COOPS), jnp.int32),
         tournament_fought_matrix=jnp.zeros((NUM_AGENTS, NUM_AGENTS, NUM_COOPS), jnp.int8),
         tournament_outcomes=jnp.zeros((NUM_AGENTS, NUM_AGENTS, NUM_COOPS), jnp.int8),
-        tournament_obs_coverage=jnp.zeros((NUM_AGENTS, NUM_COOPS), jnp.int8),
+        tournament_step_obs_coverage=jnp.zeros(
+            (MAX_STEPS_PER_TOURNAMENT, NUM_AGENTS, NUM_COOPS), jnp.int8
+        ),
+        tournament_step_outcomes=jnp.zeros(
+            (MAX_STEPS_PER_TOURNAMENT, NUM_AGENTS, NUM_AGENTS, NUM_COOPS), jnp.int8
+        ),
+        battle_outcome=state.battle_outcome,
         battle_history=battle_history,
         obs_mask=obs_mask,
-        crown_counts=new_crown_counts,
+        observation_history=observation_history,
+        last_tournament_observed_outcomes=last_tournament_observed_outcomes,
+        crown_history=crown_history,
         tournament_index=tournament_idx + 1,
+        tournament_step_index=jnp.int32(0),
         step_done_flag=jnp.bool_(False),
     )
 
 
-def _run_one_step_body(_: int, state: SimulationState) -> SimulationState:
+def tournament_step_body(_: int, state: SimulationState) -> SimulationState:
     """Body for the inner lax.fori_loop over steps."""
 
     def run_env_step(_unused: None) -> SimulationState:
@@ -628,11 +703,14 @@ def _run_one_step_body(_: int, state: SimulationState) -> SimulationState:
     )
 
 
-def _run_one_tournament_body(_: int, state: SimulationState) -> SimulationState:
+def tournament_loop_body(_: int, state: SimulationState) -> SimulationState:
     """Body for the outer lax.fori_loop over tournaments."""
-    state_with_fresh_step_flag = state._replace(step_done_flag=jnp.bool_(False))
+    state_with_fresh_step_flag = state._replace(
+        tournament_step_index=jnp.int32(0),
+        step_done_flag=jnp.bool_(False),
+    )
     state_after_steps = lax.fori_loop(
-        0, MAX_STEPS_PER_TOURNAMENT, _run_one_step_body, state_with_fresh_step_flag
+        0, MAX_STEPS_PER_TOURNAMENT, tournament_step_body, state_with_fresh_step_flag
     )
     state_after_ability_update = update_ability_beliefs(state_after_steps)
     rng_key, close_rng_subkey = jax.random.split(state_after_ability_update.rng_key)
@@ -643,18 +721,23 @@ def _run_one_tournament_body(_: int, state: SimulationState) -> SimulationState:
 
 
 @jax.jit
+def run_one_tournament(state: SimulationState) -> SimulationState:
+    """Run one full tournament with compiled JAX control flow."""
+    return tournament_loop_body(0, state)
+
+
 def run_simulation(initial_state: SimulationState) -> SimulationState:
     """Run the full simulation across all tournaments."""
-    return cast(
-        SimulationState,
-        lax.fori_loop(0, NUM_TOURNAMENTS, _run_one_tournament_body, initial_state),
-    )
+    state = initial_state
+    for _ in range(NUM_TOURNAMENTS):
+        state = run_one_tournament(state)
+    return state
 
 
 def initialize_pec_king_environment(
     seed: int = 0,
-) -> Tuple[SimulationState, list[Cage], list[Monitor]]:
-    """Build the initial SimulationState and Python infrastructure objects."""
+) -> SimulationState:
+    """Build the initial SimulationState."""
     base_rng_key = jax.random.PRNGKey(seed)
     ability_rng_key, coop_rng_key, simulation_rng_key = jax.random.split(base_rng_key, 3)
 
@@ -684,69 +767,53 @@ def initialize_pec_king_environment(
     initial_state = SimulationState(
         zone_array=initial_zone_array,
         transit_destination_coop=jnp.full((NUM_AGENTS,), -1, jnp.int32),
-        action_array=jnp.zeros((NUM_AGENTS,), jnp.int32),
+        action_array=jnp.zeros((NUM_AGENTS, 1), jnp.int32),
         agent_abilities=agent_abilities,
         tournament_losses_per_coop=jnp.zeros((NUM_AGENTS, NUM_COOPS), jnp.int32),
         tournament_fought_matrix=jnp.zeros((NUM_AGENTS, NUM_AGENTS, NUM_COOPS), jnp.int8),
         tournament_outcomes=jnp.zeros((NUM_AGENTS, NUM_AGENTS, NUM_COOPS), jnp.int8),
-        tournament_obs_coverage=jnp.zeros((NUM_AGENTS, NUM_COOPS), jnp.int8),
+        tournament_step_obs_coverage=jnp.zeros(
+            (MAX_STEPS_PER_TOURNAMENT, NUM_AGENTS, NUM_COOPS), jnp.int8
+        ),
+        tournament_step_outcomes=jnp.zeros(
+            (MAX_STEPS_PER_TOURNAMENT, NUM_AGENTS, NUM_AGENTS, NUM_COOPS), jnp.int8
+        ),
+        battle_outcome=jnp.zeros((NUM_AGENTS, NUM_AGENTS, NUM_COOPS), jnp.int8),
         battle_history=jnp.zeros((NUM_AGENTS, NUM_AGENTS, NUM_COOPS, NUM_TOURNAMENTS), jnp.int8),
         obs_mask=jnp.zeros((NUM_AGENTS, NUM_COOPS, NUM_TOURNAMENTS), jnp.int8),
+        observation_history=jnp.zeros((NUM_AGENTS, NUM_AGENTS, NUM_AGENTS, NUM_TOURNAMENTS), jnp.int8),
+        last_tournament_observed_outcomes=jnp.zeros(
+            (NUM_AGENTS, NUM_AGENTS, NUM_AGENTS, NUM_COOPS), jnp.int8
+        ),
         ability_beliefs=initial_ability_beliefs,
         king_beliefs=jnp.full((NUM_AGENTS, NUM_AGENTS, NUM_COOPS, 2), 0.5, jnp.float32),
-        crown_counts=jnp.zeros((NUM_AGENTS, NUM_COOPS), jnp.int32),
+        crown_history=jnp.zeros((NUM_AGENTS, NUM_COOPS, NUM_TOURNAMENTS), jnp.int8),
         tournament_index=jnp.int32(0),
+        tournament_step_index=jnp.int32(0),
         step_done_flag=jnp.bool_(False),
         rng_key=simulation_rng_key,
     )
 
-    cages = [
-        Cage(cage_id=coop_index * (NUM_AGENTS // 2) + cage_slot, home_coop_index=coop_index)
-        for coop_index in range(NUM_COOPS)
-        for cage_slot in range(NUM_AGENTS // 2)
-    ]
-    monitors = [
-        Monitor(
-            monitor_id=coop_index * NUM_COOPS + viewing_coop_index,
-            installed_in_coop_index=coop_index,
-            viewing_coop_index=viewing_coop_index,
-        )
-        for coop_index in range(NUM_COOPS)
-        for viewing_coop_index in range(NUM_COOPS)
-    ]
-    return initial_state, cages, monitors
+    return initial_state
 
 
 def build_agents(final_state: SimulationState) -> list[Agent]:
     """Reconstruct one Agent object per chicken from the final SimulationState."""
-    battle_history_np = np.array(final_state.battle_history)
-    obs_mask_np = np.array(final_state.obs_mask)
     ability_beliefs_np = np.array(final_state.ability_beliefs)
     king_beliefs_np = np.array(final_state.king_beliefs)
     agent_abilities_np = np.array(final_state.agent_abilities)
+    observation_history_np = np.array(final_state.observation_history)
+    last_tournament_observed_outcomes_np = np.array(final_state.last_tournament_observed_outcomes)
     zone_array_np = np.array(final_state.zone_array)
     transit_dest_np = np.array(final_state.transit_destination_coop)
 
-    completed_tournaments = int(final_state.tournament_index)
-    last_tournament_index = max(completed_tournaments - 1, 0)
-
     agents = []
     for agent_idx in range(NUM_AGENTS):
-        observation_memory = np.einsum(
-            "ijkt,kt->ijt",
-            battle_history_np,
-            obs_mask_np[agent_idx],
-        ).astype(np.int8)
-
+        observation_memory = observation_history_np[agent_idx]
         zone_slice = zone_array_np[agent_idx]
         coop_index = int(zone_slice.sum(axis=1).argmax())
         zone_index = int(zone_slice[coop_index].argmax())
-
-        last_tournament_obs_mask = obs_mask_np[agent_idx, :, last_tournament_index]
-        last_observation = (
-            battle_history_np[:, :, :, last_tournament_index]
-            * last_tournament_obs_mask[np.newaxis, np.newaxis, :]
-        ).astype(np.int8)
+        last_observation = last_tournament_observed_outcomes_np[agent_idx]
 
         agents.append(
             Agent(
@@ -769,26 +836,20 @@ def build_agents(final_state: SimulationState) -> list[Agent]:
 
 def to_jax_arrays(state: SimulationState) -> dict[str, jnp.ndarray]:
     """Return the four spec-required environment tensors as a labelled dict."""
-    completed_tournaments = int(state.tournament_index)
-    if completed_tournaments > 0:
-        battle_outcome = state.battle_history[:, :, :, completed_tournaments - 1]
-    else:
-        battle_outcome = state.tournament_outcomes
-
     return {
         "zone_array": state.zone_array,
         "action_array": state.action_array,
-        "battle_outcome": battle_outcome,
+        "battle_outcome": state.battle_outcome,
         "battle_history": state.battle_history,
     }
 
 
 def compute_convergence_metrics(final_state: SimulationState) -> dict[str, float | int]:
-    """Compute three summary metrics for the learned beliefs."""
+    """Compute three summary metrics for the learned beliefs and crown posterior."""
     abilities_np = np.array(final_state.agent_abilities)
     ability_beliefs_np = np.array(final_state.ability_beliefs)
     king_beliefs_np = np.array(final_state.king_beliefs)
-    crown_counts_np = np.array(final_state.crown_counts)
+    crown_history_np = np.array(final_state.crown_history)
     battle_history_np = np.array(final_state.battle_history)
     obs_mask_np = np.array(final_state.obs_mask)
     completed_tournaments = int(final_state.tournament_index)
@@ -829,8 +890,8 @@ def compute_convergence_metrics(final_state: SimulationState) -> dict[str, float
         np.abs(empirical_win_rate - mean_true_win_prob)[off_diagonal_mask].mean()
     )
 
-    empirical_king_frequency = crown_counts_np / max(completed_tournaments, 1)
-    predicted_king_probability = king_beliefs_np[:, :, :, 1].mean(axis=0)
+    empirical_king_frequency = crown_history_np.sum(axis=-1) / max(completed_tournaments, 1)
+    predicted_king_probability = king_beliefs_np[0, :, :, 1]
     king_belief_mae = float(
         np.abs(predicted_king_probability - empirical_king_frequency).mean()
     )
@@ -843,60 +904,82 @@ def compute_convergence_metrics(final_state: SimulationState) -> dict[str, float
     }
 
 
-def main() -> None:
-    """Run the full Q1 simulation and print the requested summary tables."""
+def print_report_header() -> None:
+    """Print the top-level report header."""
     print("=" * 60)
     print("PEC-KING ORDER  —  CSCi 5512 Problem 1")
     print("=" * 60)
 
+
+def print_ability_prior_report() -> None:
+    """Print the truncated Poisson ability prior table."""
     prior_probabilities = np.array(jax.nn.softmax(ABILITY_PRIOR_LOG_PROBS))
     print("\nTruncated Poisson ability prior  (rate = NUM_COOPS / 3.0 ≈ 1.333):\n")
     print(
-        pd.DataFrame(
-            {
-                "ability_level": range(1, NUM_ABILITY_LEVELS + 1),
-                "prior_probability": np.round(prior_probabilities, 4),
-            }
-        ).to_string(index=False)
+        format_table(
+            [
+                {
+                    "ability_level": ability_level,
+                    "prior_probability": f"{prior_probability:.4f}",
+                }
+                for ability_level, prior_probability in zip(
+                    range(1, NUM_ABILITY_LEVELS + 1),
+                    prior_probabilities,
+                    strict=True,
+                )
+            ]
+        )
     )
 
-    initial_state, cages, monitors = initialize_pec_king_environment(seed=0)
+
+def print_environment_summary() -> None:
+    """Print the static environment configuration summary."""
     print("\nEnvironment initialized:")
     print(f"  {NUM_AGENTS} agents  ×  {NUM_COOPS} coops")
-    print(f"  {len(cages)} cages total  ({NUM_AGENTS // 2} per BattleZone)")
-    print(f"  {len(monitors)} monitors total  ({NUM_COOPS} per SpectatorZone)")
+    print(f"  {NUM_AGENTS // 2} battle slots per coop")
+    print(f"  {NUM_COOPS} spectator views per coop")
     print(f"  Loss limit k = {MAX_LOSSES_BEFORE_ELIMINATION}")
 
+
+def run_simulation_with_timing(initial_state: SimulationState) -> tuple[SimulationState, float]:
+    """Run the full simulation and return the final state plus elapsed seconds."""
     print(f"\nCompiling and running {NUM_TOURNAMENTS} tournaments ...")
     simulation_start_time = time.time()
     final_state = run_simulation(initial_state)
     final_state.tournament_index.block_until_ready()
-    simulation_elapsed_seconds = time.time() - simulation_start_time
+    return final_state, time.time() - simulation_start_time
 
-    print(f"Done in {simulation_elapsed_seconds:.1f} s  (includes one-time JIT compilation)")
+
+def print_simulation_summary(final_state: SimulationState, elapsed_seconds: float) -> None:
+    """Print the simulation runtime and convergence summary."""
+    print(f"Done in {elapsed_seconds:.1f} s  (includes one-time JIT compilation)")
     print(f"Completed tournaments: {int(final_state.tournament_index)}")
 
     metrics = compute_convergence_metrics(final_state)
     print(f"\nConvergence metrics after {metrics['completed_tournaments']} tournaments:")
     print(f"  Ability MAP accuracy             {metrics['ability_map_accuracy']:.4f}")
     print(f"  Win belief MAE                   {metrics['win_belief_mae']:.4f}")
-    print(f"  King belief MAE                  {metrics['king_belief_mae']:.4f}")
+    print(f"  King posterior MAE               {metrics['king_belief_mae']:.4f}")
 
-    agents = build_agents(final_state)
+
+def print_state_tensor_report(final_state: SimulationState) -> None:
+    """Print the required JAX tensor shapes."""
     jax_array_dict = to_jax_arrays(final_state)
-    state_shapes_table = pd.DataFrame(
-        [
-            {"tensor": name, "shape": str(tuple(array.shape)), "dtype": str(array.dtype)}
-            for name, array in jax_array_dict.items()
-        ]
-    )
+    state_shapes_rows = [
+        {"tensor": name, "shape": str(tuple(array.shape)), "dtype": str(array.dtype)}
+        for name, array in jax_array_dict.items()
+    ]
     print("\nSpec-required JAX environment tensors:\n")
-    print(state_shapes_table.to_string(index=False))
+    print(format_table(state_shapes_rows))
 
+
+def build_sample_win_table_rows(final_state: SimulationState) -> list[dict[str, object]]:
+    """Build sample pairwise empirical win-rate rows for reporting."""
     abilities_np = np.array(final_state.agent_abilities)
     battle_history_np = np.array(final_state.battle_history)
     sample_pairs = [(0, 1, 0), (0, 7, 1), (3, 12, 2), (10, 25, 3), (5, 41, 0)]
-    win_table_rows = []
+    win_table_rows: list[dict[str, object]] = []
+
     for agent_i, agent_j, coop_index in sample_pairs:
         ability_i = int(abilities_np[agent_i, coop_index])
         ability_j = int(abilities_np[agent_j, coop_index])
@@ -916,20 +999,30 @@ def main() -> None:
             }
         )
 
-    print("\nSample pairwise win beliefs (empirical rate from battle history):\n")
-    print(pd.DataFrame(win_table_rows).to_string(index=False))
+    return win_table_rows
 
-    crown_counts_np = np.array(final_state.crown_counts)
+
+def print_sample_win_report(final_state: SimulationState) -> None:
+    """Print sample pairwise win-belief rows."""
+    print("\nSample pairwise win beliefs (empirical rate from battle history):\n")
+    print(format_table(build_sample_win_table_rows(final_state)))
+
+
+def build_king_table_rows(final_state: SimulationState) -> tuple[list[dict[str, object]], np.ndarray]:
+    """Build crown-posterior rows for the five most-crowned agents."""
+    crown_history_np = np.array(final_state.crown_history)
+    crown_counts_np = crown_history_np.sum(axis=-1)
     completed_tournaments = int(final_state.tournament_index)
     empirical_king_frequency = crown_counts_np / max(completed_tournaments, 1)
     king_beliefs_np = np.array(final_state.king_beliefs)
-    predicted_king_probability = king_beliefs_np[:, :, :, 1].mean(axis=0)
+    predicted_king_probability = king_beliefs_np[0, :, :, 1]
     all_ability_beliefs_np = np.array(final_state.ability_beliefs)
     pooled_ability_beliefs = all_ability_beliefs_np.mean(axis=0)
     observed_per_coop: npt.NDArray[np.bool_] = np.asarray(
         np.array(final_state.obs_mask).any(axis=-1),
         dtype=np.bool_,
     )
+    abilities_np = np.array(final_state.agent_abilities)
 
     for coop_index in range(NUM_COOPS):
         observer_mask: npt.NDArray[np.bool_] = observed_per_coop[:, coop_index]
@@ -939,7 +1032,7 @@ def main() -> None:
             ].mean(axis=0)
 
     top_five_agents = np.argsort(-crown_counts_np.sum(axis=1))[:5]
-    king_table_rows = []
+    king_table_rows: list[dict[str, object]] = []
     for agent_idx in top_five_agents:
         for coop_index in range(NUM_COOPS):
             ability_map_estimate = int(pooled_ability_beliefs[agent_idx, coop_index].argmax()) + 1
@@ -952,37 +1045,68 @@ def main() -> None:
                     "empirical_P_king": round(
                         float(empirical_king_frequency[agent_idx, coop_index]), 4
                     ),
-                    "predicted_P_king": round(
+                    "posterior_P_king": round(
                         float(predicted_king_probability[agent_idx, coop_index]), 4
                     ),
                 }
             )
+    return king_table_rows, top_five_agents
 
-    print("\nKing beliefs for the 5 most-crowned agents:\n")
-    print(pd.DataFrame(king_table_rows).to_string(index=False))
 
-    sample_agent = agents[top_five_agents[0]]
-    self_king_probability_per_coop = sample_agent.king_belief[sample_agent.agent_index, :, 1]
-    normalized_ability_per_coop = sample_agent.my_ability / NUM_ABILITY_LEVELS
-    policy_scores = (
-        ABILITY_SCORE_POLICY_WEIGHT * normalized_ability_per_coop
-        + KING_BELIEF_POLICY_WEIGHT * self_king_probability_per_coop
+def print_king_belief_report(final_state: SimulationState) -> np.ndarray:
+    """Print crown-posterior rows and return the top-ranked agent indices."""
+    king_table_rows, top_five_agents = build_king_table_rows(final_state)
+    print("\nKing posterior from public crown history for the 5 most-crowned agents:\n")
+    print(format_table(king_table_rows))
+    return top_five_agents
+
+
+def print_sample_agent_report(sample_agent: Agent) -> None:
+    """Print a compact post-simulation report for one reconstructed agent."""
+    sample_policy_scores = np.array(
+        compute_policy_scores(
+            jnp.asarray(sample_agent.my_ability[None, :]),
+            jnp.asarray(sample_agent.king_belief[None, :, :]),
+        )[0]
     )
-    best_policy_coop = int(policy_scores.argmax())
+    best_policy_coop = int(sample_policy_scores.argmax())
+    zone_name = (
+        "BATTLE"
+        if sample_agent.my_location.zone_index == ZONE_BATTLE
+        else "SPECTATOR"
+        if sample_agent.my_location.zone_index == ZONE_SPECTATOR
+        else "TRANSIT"
+    )
 
     print(f"\nSample agent (index {sample_agent.agent_index}):")
     print(
         f"  Location       coop {sample_agent.my_location.coop_index}, "
-        f"zone {sample_agent.my_location.zone_index} "
-        f"({'BATTLE' if sample_agent.my_location.zone_index == ZONE_BATTLE else 'SPECTATOR' if sample_agent.my_location.zone_index == ZONE_SPECTATOR else 'TRANSIT'})"
+        f"zone {sample_agent.my_location.zone_index} ({zone_name})"
     )
     print(f"  Own abilities  {(sample_agent.my_ability + 1).tolist()}  (1-indexed, one per coop)")
-    print(f"  Policy scores  {np.round(policy_scores, 4).tolist()}  (best coop = {best_policy_coop})")
     print(
-        "  Policy note    final post-simulation state is after tournament reset, so all agents "
-        "are back in BATTLE and action_policy() would return ('no_op', -1) until the next "
-        "cage assignment."
+        f"  Policy scores  {np.round(sample_policy_scores, 4).tolist()}  (best coop = {best_policy_coop})"
     )
+    print(
+        "  Policy note    this Agent is a post-simulation reporting view; the live simulation "
+        "uses the shared JAX policy in compute_all_agent_actions(). The final state is also "
+        "after tournament reset, so all agents are back in BATTLE until the next cage assignment."
+    )
+
+
+def main() -> None:
+    """Run the full Q1 simulation and print the requested summary tables."""
+    print_report_header()
+    print_ability_prior_report()
+    initial_state = initialize_pec_king_environment(seed=0)
+    print_environment_summary()
+    final_state, simulation_elapsed_seconds = run_simulation_with_timing(initial_state)
+    print_simulation_summary(final_state, simulation_elapsed_seconds)
+    agents = build_agents(final_state)
+    print_state_tensor_report(final_state)
+    print_sample_win_report(final_state)
+    top_five_agents = print_king_belief_report(final_state)
+    print_sample_agent_report(agents[int(top_five_agents[0])])
 
 
 if __name__ == "__main__":
